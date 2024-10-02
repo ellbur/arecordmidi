@@ -30,6 +30,7 @@
 #include <sys/poll.h>
 #include <alsa/asoundlib.h>
 #include "version.h"
+#include <stdbool.h>
 
 #define BUFFER_SIZE 4088
 
@@ -45,16 +46,12 @@ struct smf_track {
 	struct buffer *cur_buf;
 	snd_seq_tick_time_t last_tick;	/* end of track */
 	unsigned char last_command;	/* used for running status */
-	int used;			/* anything record on this track */
 	struct buffer first_buf;	/* list head */
 };
 
-/* timing/sysex + 16 channels */
-#define TRACKS_PER_PORT 17
-
 static snd_seq_t *seq;
 static int client;
-static int port_count;
+static bool got_a_port;
 static snd_seq_addr_t port;
 static int queue;
 static int smpte_timing = 0;
@@ -63,9 +60,7 @@ static int frames;
 static int ticks = 0;
 static int timeout = 0;
 static FILE *file;
-static int channel_split;
-static int num_tracks;
-static struct smf_track *tracks;
+static struct smf_track track = { };
 static volatile sig_atomic_t stop = 0;
 static int ts_num = 4; /* time signature: numerator */
 static int ts_div = 4; /* time signature: denominator */
@@ -83,13 +78,6 @@ static void fatal(const char *msg, ...)
 	va_end(ap);
 	fputc('\n', stderr);
 	exit(EXIT_FAILURE);
-}
-
-/* memory allocation error handling */
-static void check_mem(void *p)
-{
-	if (!p)
-		fatal("Out of memory");
 }
 
 /* error handling for ALSA functions */
@@ -132,7 +120,7 @@ static void parse_port(const char *arg)
 	if (err < 0)
 		fatal("Invalid port %s - %s", port_name, snd_strerror(err));
 	
-	port_count += 1;
+	got_a_port = true;
 }
 
 /* parses time signature specification */
@@ -155,19 +143,7 @@ static void time_signature(const char *arg)
 
 static void init_tracks(void)
 {
-	int i;
-
-	/* MIDI RP-019 says we need at least one track per port */
-	num_tracks = port_count;
-	/* Allocate one track for each possible channel.
-	 * Empty tracks won't be written to the file. */
-	if (channel_split)
-		num_tracks *= TRACKS_PER_PORT;
-
-	tracks = calloc(num_tracks, sizeof(struct smf_track));
-	check_mem(tracks);
-	for (i = 0; i < num_tracks; ++i)
-		tracks[i].cur_buf = &tracks[i].first_buf;
+	track.cur_buf = &track.first_buf;
 }
 
 static void create_queue(void)
@@ -219,7 +195,7 @@ static void create_queue(void)
 static void create_port(void)
 {
 	snd_seq_port_info_t *pinfo;
-	int i, err;
+	int err;
 	char name[32];
 
 	snd_seq_port_info_alloca(&pinfo);
@@ -239,15 +215,14 @@ static void create_port(void)
 
 	/* our port number is the same as our port index */
 	snd_seq_port_info_set_port_specified(pinfo, 1);
-	for (i = 0; i < port_count; ++i) {
-		snd_seq_port_info_set_port(pinfo, i);
+	
+	snd_seq_port_info_set_port(pinfo, 0);
 
-		sprintf(name, "arecordmidi port %i", i);
-		snd_seq_port_info_set_name(pinfo, name);
+	sprintf(name, "arecordmidi port %i", 0);
+	snd_seq_port_info_set_name(pinfo, name);
 
-		err = snd_seq_create_port(seq, pinfo);
-		check_snd("create port", err);
-	}
+	err = snd_seq_create_port(seq, pinfo);
+	check_snd("create port", err);
 }
 
 static void connect_port(void)
@@ -309,28 +284,8 @@ static void command(struct smf_track *track, unsigned char cmd)
 	track->last_command = cmd < 0xf0 ? cmd : 0;
 }
 
-/* put port numbers into all tracks */
-static void record_port_numbers(void)
-{
-	int i;
-
-	for (i = 0; i < num_tracks; ++i) {
-		var_value(&tracks[i], 0);
-		add_byte(&tracks[i], 0xff);
-		add_byte(&tracks[i], 0x21);
-		var_value(&tracks[i], 1);
-		if (channel_split)
-			add_byte(&tracks[i], i / TRACKS_PER_PORT);
-		else
-			add_byte(&tracks[i], i);
-	}
-}
-
 static void record_event(const snd_seq_event_t *ev)
 {
-	unsigned int i;
-	struct smf_track *track;
-
 	/* ignore events without proper timestamps */
 	if (ev->queue != queue || !snd_seq_ev_is_tick(ev))
 		return;
@@ -339,99 +294,93 @@ static void record_event(const snd_seq_event_t *ev)
 		t_start = ev->time.tick;
 
 	/* determine which track to record to */
-	i = ev->dest.port;
-	if (channel_split) {
-		i *= TRACKS_PER_PORT;
-		if (snd_seq_ev_is_channel_type(ev))
-			i += 1 + (ev->data.note.channel & 0xf);
-	}
-	if (i >= num_tracks)
+	// Our one port and one track
+	if (ev->dest.port != 0)
 		return;
-	track = &tracks[i];
-
+	
 	switch (ev->type) {
 	case SND_SEQ_EVENT_NOTEON:
-		delta_time(track, ev);
-		command(track, MIDI_CMD_NOTE_ON | (ev->data.note.channel & 0xf));
-		add_byte(track, ev->data.note.note & 0x7f);
-		add_byte(track, ev->data.note.velocity & 0x7f);
+		delta_time(&track, ev);
+		command(&track, MIDI_CMD_NOTE_ON | (ev->data.note.channel & 0xf));
+		add_byte(&track, ev->data.note.note & 0x7f);
+		add_byte(&track, ev->data.note.velocity & 0x7f);
 		break;
 	case SND_SEQ_EVENT_NOTEOFF:
-		delta_time(track, ev);
-		command(track, MIDI_CMD_NOTE_OFF | (ev->data.note.channel & 0xf));
-		add_byte(track, ev->data.note.note & 0x7f);
-		add_byte(track, ev->data.note.velocity & 0x7f);
+		delta_time(&track, ev);
+		command(&track, MIDI_CMD_NOTE_OFF | (ev->data.note.channel & 0xf));
+		add_byte(&track, ev->data.note.note & 0x7f);
+		add_byte(&track, ev->data.note.velocity & 0x7f);
 		break;
 	case SND_SEQ_EVENT_KEYPRESS:
-		delta_time(track, ev);
-		command(track, MIDI_CMD_NOTE_PRESSURE | (ev->data.note.channel & 0xf));
-		add_byte(track, ev->data.note.note & 0x7f);
-		add_byte(track, ev->data.note.velocity & 0x7f);
+		delta_time(&track, ev);
+		command(&track, MIDI_CMD_NOTE_PRESSURE | (ev->data.note.channel & 0xf));
+		add_byte(&track, ev->data.note.note & 0x7f);
+		add_byte(&track, ev->data.note.velocity & 0x7f);
 		break;
 	case SND_SEQ_EVENT_CONTROLLER:
-		delta_time(track, ev);
-		command(track, MIDI_CMD_CONTROL | (ev->data.control.channel & 0xf));
-		add_byte(track, ev->data.control.param & 0x7f);
-		add_byte(track, ev->data.control.value & 0x7f);
+		delta_time(&track, ev);
+		command(&track, MIDI_CMD_CONTROL | (ev->data.control.channel & 0xf));
+		add_byte(&track, ev->data.control.param & 0x7f);
+		add_byte(&track, ev->data.control.value & 0x7f);
 		break;
 	case SND_SEQ_EVENT_PGMCHANGE:
-		delta_time(track, ev);
-		command(track, MIDI_CMD_PGM_CHANGE | (ev->data.control.channel & 0xf));
-		add_byte(track, ev->data.control.value & 0x7f);
+		delta_time(&track, ev);
+		command(&track, MIDI_CMD_PGM_CHANGE | (ev->data.control.channel & 0xf));
+		add_byte(&track, ev->data.control.value & 0x7f);
 		break;
 	case SND_SEQ_EVENT_CHANPRESS:
-		delta_time(track, ev);
-		command(track, MIDI_CMD_CHANNEL_PRESSURE | (ev->data.control.channel & 0xf));
-		add_byte(track, ev->data.control.value & 0x7f);
+		delta_time(&track, ev);
+		command(&track, MIDI_CMD_CHANNEL_PRESSURE | (ev->data.control.channel & 0xf));
+		add_byte(&track, ev->data.control.value & 0x7f);
 		break;
 	case SND_SEQ_EVENT_PITCHBEND:
-		delta_time(track, ev);
-		command(track, MIDI_CMD_BENDER | (ev->data.control.channel & 0xf));
-		add_byte(track, (ev->data.control.value + 8192) & 0x7f);
-		add_byte(track, ((ev->data.control.value + 8192) >> 7) & 0x7f);
+		delta_time(&track, ev);
+		command(&track, MIDI_CMD_BENDER | (ev->data.control.channel & 0xf));
+		add_byte(&track, (ev->data.control.value + 8192) & 0x7f);
+		add_byte(&track, ((ev->data.control.value + 8192) >> 7) & 0x7f);
 		break;
 	case SND_SEQ_EVENT_CONTROL14:
 		/* create two commands for MSB and LSB */
-		delta_time(track, ev);
-		command(track, MIDI_CMD_CONTROL | (ev->data.control.channel & 0xf));
-		add_byte(track, ev->data.control.param & 0x7f);
-		add_byte(track, (ev->data.control.value >> 7) & 0x7f);
+		delta_time(&track, ev);
+		command(&track, MIDI_CMD_CONTROL | (ev->data.control.channel & 0xf));
+		add_byte(&track, ev->data.control.param & 0x7f);
+		add_byte(&track, (ev->data.control.value >> 7) & 0x7f);
 		if ((ev->data.control.param & 0x7f) < 0x20) {
-			delta_time(track, ev);
+			delta_time(&track, ev);
 			/* running status */
-			add_byte(track, (ev->data.control.param & 0x7f) + 0x20);
-			add_byte(track, ev->data.control.value & 0x7f);
+			add_byte(&track, (ev->data.control.param & 0x7f) + 0x20);
+			add_byte(&track, ev->data.control.value & 0x7f);
 		}
 		break;
 	case SND_SEQ_EVENT_NONREGPARAM:
-		delta_time(track, ev);
-		command(track, MIDI_CMD_CONTROL | (ev->data.control.channel & 0xf));
-		add_byte(track, MIDI_CTL_NONREG_PARM_NUM_LSB);
-		add_byte(track, ev->data.control.param & 0x7f);
-		delta_time(track, ev);
-		add_byte(track, MIDI_CTL_NONREG_PARM_NUM_MSB);
-		add_byte(track, (ev->data.control.param >> 7) & 0x7f);
-		delta_time(track, ev);
-		add_byte(track, MIDI_CTL_MSB_DATA_ENTRY);
-		add_byte(track, (ev->data.control.value >> 7) & 0x7f);
-		delta_time(track, ev);
-		add_byte(track, MIDI_CTL_LSB_DATA_ENTRY);
-		add_byte(track, ev->data.control.value & 0x7f);
+		delta_time(&track, ev);
+		command(&track, MIDI_CMD_CONTROL | (ev->data.control.channel & 0xf));
+		add_byte(&track, MIDI_CTL_NONREG_PARM_NUM_LSB);
+		add_byte(&track, ev->data.control.param & 0x7f);
+		delta_time(&track, ev);
+		add_byte(&track, MIDI_CTL_NONREG_PARM_NUM_MSB);
+		add_byte(&track, (ev->data.control.param >> 7) & 0x7f);
+		delta_time(&track, ev);
+		add_byte(&track, MIDI_CTL_MSB_DATA_ENTRY);
+		add_byte(&track, (ev->data.control.value >> 7) & 0x7f);
+		delta_time(&track, ev);
+		add_byte(&track, MIDI_CTL_LSB_DATA_ENTRY);
+		add_byte(&track, ev->data.control.value & 0x7f);
 		break;
 	case SND_SEQ_EVENT_REGPARAM:
-		delta_time(track, ev);
-		command(track, MIDI_CMD_CONTROL | (ev->data.control.channel & 0xf));
-		add_byte(track, MIDI_CTL_REGIST_PARM_NUM_LSB);
-		add_byte(track, ev->data.control.param & 0x7f);
-		delta_time(track, ev);
-		add_byte(track, MIDI_CTL_REGIST_PARM_NUM_MSB);
-		add_byte(track, (ev->data.control.param >> 7) & 0x7f);
-		delta_time(track, ev);
-		add_byte(track, MIDI_CTL_MSB_DATA_ENTRY);
-		add_byte(track, (ev->data.control.value >> 7) & 0x7f);
-		delta_time(track, ev);
-		add_byte(track, MIDI_CTL_LSB_DATA_ENTRY);
-		add_byte(track, ev->data.control.value & 0x7f);
+		delta_time(&track, ev);
+		command(&track, MIDI_CMD_CONTROL | (ev->data.control.channel & 0xf));
+		add_byte(&track, MIDI_CTL_REGIST_PARM_NUM_LSB);
+		add_byte(&track, ev->data.control.param & 0x7f);
+		delta_time(&track, ev);
+		add_byte(&track, MIDI_CTL_REGIST_PARM_NUM_MSB);
+		add_byte(&track, (ev->data.control.param >> 7) & 0x7f);
+		delta_time(&track, ev);
+		add_byte(&track, MIDI_CTL_MSB_DATA_ENTRY);
+		add_byte(&track, (ev->data.control.value >> 7) & 0x7f);
+		delta_time(&track, ev);
+		add_byte(&track, MIDI_CTL_LSB_DATA_ENTRY);
+		add_byte(&track, ev->data.control.value & 0x7f);
 		break;
 #if 0	/* ignore */
 	case SND_SEQ_EVENT_SONGPOS:
@@ -448,25 +397,24 @@ static void record_event(const snd_seq_event_t *ev)
 	case SND_SEQ_EVENT_SYSEX:
 		if (ev->data.ext.len == 0)
 			break;
-		delta_time(track, ev);
+		delta_time(&track, ev);
 		if (*(unsigned char*)ev->data.ext.ptr == 0xf0)
-			command(track, 0xf0), i = 1;
+			command(&track, 0xf0);
 		else
-			command(track, 0xf7), i = 0;
-		var_value(track, ev->data.ext.len - i);
-		for (; i < ev->data.ext.len; ++i)
-			add_byte(track, ((unsigned char*)ev->data.ext.ptr)[i]);
+			command(&track, 0xf7);
+		var_value(&track, ev->data.ext.len);
+		for (int i = 0; i < ev->data.ext.len; ++i)
+			add_byte(&track, ((unsigned char*)ev->data.ext.ptr)[i]);
 		break;
 	default:
 		return;
 	}
-	track->used = 1;
 }
 
 static void finish_tracks(void)
 {
 	snd_seq_queue_status_t *queue_status;
-	int tick, i, err;
+	int tick, err;
 
 	snd_seq_queue_status_alloca(&queue_status);
 
@@ -474,38 +422,26 @@ static void finish_tracks(void)
 	check_snd("get queue status", err);
 	tick = snd_seq_queue_status_get_tick_time(queue_status);
 
-	/* make length of first track the recording length */
-	var_value(&tracks[0], tick - tracks[0].last_tick);
-	add_byte(&tracks[0], 0xff);
-	add_byte(&tracks[0], 0x2f);
-	var_value(&tracks[0], 0);
-
-	/* finish other tracks */
-	for (i = 1; i < num_tracks; ++i) {
-		var_value(&tracks[i], 0);
-		add_byte(&tracks[i], 0xff);
-		add_byte(&tracks[i], 0x2f);
-		var_value(&tracks[i], 0);
-	}
+	/* make length of first (and only) track the recording length */
+	var_value(&track, tick - track.last_tick);
+	add_byte(&track, 0xff);
+	add_byte(&track, 0x2f);
+	var_value(&track, 0);
 }
 
 static void write_file(void)
 {
-	int used_tracks, time_division, i;
+	int time_division;
 	struct buffer *buf;
-
-	used_tracks = 0;
-	for (i = 0; i < num_tracks; ++i)
-		used_tracks += !!tracks[i].used;
 
 	/* header id and length */
 	fwrite("MThd\0\0\0\6", 1, 8, file);
 	/* type 0 or 1 */
 	fputc(0, file);
-	fputc(used_tracks > 1, file);
+	fputc(false, file);
 	/* number of tracks */
-	fputc((used_tracks >> 8) & 0xff, file);
-	fputc(used_tracks & 0xff, file);
+	fputc((1 >> 8) & 0xff, file);
+	fputc(1 & 0xff, file);
 	/* time division */
 	time_division = ticks;
 	if (smpte_timing)
@@ -513,21 +449,18 @@ static void write_file(void)
 	fputc(time_division >> 8, file);
 	fputc(time_division & 0xff, file);
 
-	for (i = 0; i < num_tracks; ++i) {
-		if (!tracks[i].used)
-			continue;
-		/* track id */
-		fwrite("MTrk", 1, 4, file);
-		/* data length */
-		fputc((tracks[i].size >> 24) & 0xff, file);
-		fputc((tracks[i].size >> 16) & 0xff, file);
-		fputc((tracks[i].size >> 8) & 0xff, file);
-		fputc(tracks[i].size & 0xff, file);
-		/* track contents */
-		for (buf = &tracks[i].first_buf; buf; buf = buf->next)
-			fwrite(buf->buf, 1, buf == tracks[i].cur_buf
-			       ? tracks[i].cur_buf_size : BUFFER_SIZE, file);
-	}
+	/* track id */
+	fwrite("MTrk", 1, 4, file);
+	/* data length */
+	fputc((track.size >> 24) & 0xff, file);
+	fputc((track.size >> 16) & 0xff, file);
+	fputc((track.size >> 8) & 0xff, file);
+	fputc(track.size & 0xff, file);
+	
+	/* track contents */
+	for (buf = &track.first_buf; buf; buf = buf->next)
+		fwrite(buf->buf, 1, buf == track.cur_buf
+				? track.cur_buf_size : BUFFER_SIZE, file);
 }
 
 static void list_ports(void)
@@ -654,9 +587,6 @@ int main(int argc, char *argv[])
 			if (ticks < 1 || ticks > 0x7fff)
 				fatal("Invalid number of ticks");
 			break;
-		case 's':
-			channel_split = 1;
-			break;
 		case 'd':
 			fputs("The --dump option isn't supported anymore, use aseqdump instead.\n", stderr);
 			break;
@@ -679,7 +609,7 @@ int main(int argc, char *argv[])
 		return 0;
 	}
 
-	if (port_count < 1) {
+	if (!got_a_port) {
 		fputs("Pleast specify a source port with --port.\n", stderr);
 		return 1;
 	}
@@ -699,34 +629,29 @@ int main(int argc, char *argv[])
 	create_queue();
 	create_port();
 	connect_port();
-	if (port_count > 1)
-		record_port_numbers();
 
 	/* record tempo */
 	if (!smpte_timing) {
 		int usecs_per_quarter = 60000000 / beats;
-		var_value(&tracks[0], 0); /* delta time */
-		add_byte(&tracks[0], 0xff);
-		add_byte(&tracks[0], 0x51);
-		var_value(&tracks[0], 3);
-		add_byte(&tracks[0], usecs_per_quarter >> 16);
-		add_byte(&tracks[0], usecs_per_quarter >> 8);
-		add_byte(&tracks[0], usecs_per_quarter);
+		var_value(&track, 0); /* delta time */
+		add_byte(&track, 0xff);
+		add_byte(&track, 0x51);
+		var_value(&track, 3);
+		add_byte(&track, usecs_per_quarter >> 16);
+		add_byte(&track, usecs_per_quarter >> 8);
+		add_byte(&track, usecs_per_quarter);
 
 		/* time signature */
-		var_value(&tracks[0], 0); /* delta time */
-		add_byte(&tracks[0], 0xff);
-		add_byte(&tracks[0], 0x58);
-		var_value(&tracks[0], 4);
-		add_byte(&tracks[0], ts_num);
-		add_byte(&tracks[0], ts_dd);
-		add_byte(&tracks[0], 24); /* MIDI clocks per metronome click */
-		add_byte(&tracks[0], 8); /* notated 32nd-notes per MIDI quarter note */
+		var_value(&track, 0); /* delta time */
+		add_byte(&track, 0xff);
+		add_byte(&track, 0x58);
+		var_value(&track, 4);
+		add_byte(&track, ts_num);
+		add_byte(&track, ts_dd);
+		add_byte(&track, 24); /* MIDI clocks per metronome click */
+		add_byte(&track, 8); /* notated 32nd-notes per MIDI quarter note */
 	}
 	
-	/* always write at least one track */
-	tracks[0].used = 1;
-
 	file = fopen(filename, "wb");
 	if (!file)
 		fatal("Cannot open %s - %s", filename, strerror(errno));
