@@ -412,24 +412,6 @@ static void record_event(const snd_seq_event_t *ev)
 	}
 }
 
-static void finish_tracks(void)
-{
-	snd_seq_queue_status_t *queue_status;
-	int tick, err;
-
-	snd_seq_queue_status_alloca(&queue_status);
-
-	err = snd_seq_get_queue_status(seq, queue, queue_status);
-	check_snd("get queue status", err);
-	tick = snd_seq_queue_status_get_tick_time(queue_status);
-
-	/* make length of first (and only) track the recording length */
-	var_value(&track, tick - track.last_tick);
-	add_byte(&track, 0xff);
-	add_byte(&track, 0x2f);
-	var_value(&track, 0);
-}
-
 static void write_header(void)
 {
 	int time_division;
@@ -464,6 +446,32 @@ static void write_header(void)
 	fputc(track.size & 0xff, file);
 }
 
+/* record a variable-length quantity directly to file */
+static int var_value_direct(int v)
+{
+	int extra_size = 0;
+	
+	if (v >= (1 << 28)) {
+		fputc(0x80 | ((v >> 28) & 0x03), file);
+		extra_size += 1;
+	}
+	if (v >= (1 << 21)) {
+		fputc(0x80 | ((v >> 21) & 0x7f), file);
+		extra_size += 1;
+	}
+	if (v >= (1 << 14)) {
+		fputc(0x80 | ((v >> 14) & 0x7f), file);
+		extra_size += 1;
+	}
+	if (v >= (1 << 7)) {
+		fputc(0x80 | ((v >> 7) & 0x7f), file);
+		extra_size += 1;
+	}
+	fputc(v & 0x7f, file);
+	extra_size += 1;
+	return extra_size;
+}
+
 static void flush_buffer(void)
 {
 	struct buffer *buf;
@@ -474,7 +482,7 @@ static void flush_buffer(void)
 				? track.cur_buf_size : BUFFER_SIZE, file);
 }
 
-static void update_length(void)
+static void update_length(int extra_size)
 {
 	// Save position
 	long saved_pos = ftell(file);
@@ -482,14 +490,49 @@ static void update_length(void)
 	// Jump back to where we recorded the length
 	fseek(file, size_offset, SEEK_SET);
 	
-	fputc((track.size >> 24) & 0xff, file);
-	fputc((track.size >> 16) & 0xff, file);
-	fputc((track.size >> 8) & 0xff, file);
-	fputc(track.size & 0xff, file);
+	int size = track.size += extra_size;
+	
+	fputc((size >> 24) & 0xff, file);
+	fputc((size >> 16) & 0xff, file);
+	fputc((size >> 8) & 0xff, file);
+	fputc(size & 0xff, file);
 	
 	// Jump back to where we were
-	fseek(file, saved_pos, SEEK_END);
+	fseek(file, saved_pos, SEEK_SET);
 }
+
+static int write_track_end(void)
+{
+	snd_seq_queue_status_t *queue_status;
+	int tick, err;
+	int extra_size = 0;
+
+	snd_seq_queue_status_alloca(&queue_status);
+
+	err = snd_seq_get_queue_status(seq, queue, queue_status);
+	check_snd("get queue status", err);
+	tick = snd_seq_queue_status_get_tick_time(queue_status);
+
+	/* make length of first (and only) track the recording length */
+	extra_size += var_value_direct(tick - track.last_tick);
+	fputc(0xff, file);
+	fputc(0x2f, file);
+	extra_size += 2;
+	extra_size += var_value_direct(0);
+	
+	return extra_size;
+}
+
+// TODO
+/*
+static int write_temporary_track_end(void)
+{
+	long saved_pos = ftell(file);
+	int extra_size = write_track_end();
+	fseek(file, saved_pos, SEEK_SET);
+	return extra_size;
+}
+*/
 
 static void list_ports(void)
 {
@@ -721,10 +764,9 @@ int main(int argc, char *argv[])
 			break;
 	}
 
-	finish_tracks();
-	
 	flush_buffer();
-	update_length();
+	int extra_size = write_track_end();
+	update_length(extra_size);
 
 	fclose(file);
 	snd_seq_close(seq);
