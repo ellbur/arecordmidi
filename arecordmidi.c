@@ -60,6 +60,7 @@ static int frames;
 static int ticks = 0;
 static int timeout = 0;
 static FILE *file;
+static long size_offset;
 static struct smf_track track = { };
 static volatile sig_atomic_t stop = 0;
 static int ts_num = 4; /* time signature: numerator */
@@ -429,10 +430,9 @@ static void finish_tracks(void)
 	var_value(&track, 0);
 }
 
-static void write_file(void)
+static void write_header(void)
 {
 	int time_division;
-	struct buffer *buf;
 
 	/* header id and length */
 	fwrite("MThd\0\0\0\6", 1, 8, file);
@@ -451,16 +451,44 @@ static void write_file(void)
 
 	/* track id */
 	fwrite("MTrk", 1, 4, file);
+	
 	/* data length */
+	
+	// Record where the length is stored, so we can update it
+	// when data is added to the file.
+	size_offset = ftell(file);
+	
 	fputc((track.size >> 24) & 0xff, file);
 	fputc((track.size >> 16) & 0xff, file);
 	fputc((track.size >> 8) & 0xff, file);
 	fputc(track.size & 0xff, file);
+}
+
+static void flush_buffer(void)
+{
+	struct buffer *buf;
 	
 	/* track contents */
 	for (buf = &track.first_buf; buf; buf = buf->next)
 		fwrite(buf->buf, 1, buf == track.cur_buf
 				? track.cur_buf_size : BUFFER_SIZE, file);
+}
+
+static void update_length(void)
+{
+	// Save position
+	long saved_pos = ftell(file);
+	
+	// Jump back to where we recorded the length
+	fseek(file, size_offset, SEEK_SET);
+	
+	fputc((track.size >> 24) & 0xff, file);
+	fputc((track.size >> 16) & 0xff, file);
+	fputc((track.size >> 8) & 0xff, file);
+	fputc(track.size & 0xff, file);
+	
+	// Jump back to where we were
+	fseek(file, saved_pos, SEEK_END);
 }
 
 static void list_ports(void)
@@ -663,6 +691,8 @@ int main(int argc, char *argv[])
 	err = snd_seq_nonblock(seq, 1);
 	check_snd("set nonblock mode", err);
 	
+	write_header();
+	
 	signal(SIGINT, sighandler);
 	signal(SIGTERM, sighandler);
 
@@ -692,7 +722,9 @@ int main(int argc, char *argv[])
 	}
 
 	finish_tracks();
-	write_file();
+	
+	flush_buffer();
+	update_length();
 
 	fclose(file);
 	snd_seq_close(seq);
