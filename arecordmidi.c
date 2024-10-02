@@ -52,18 +52,10 @@ struct smf_track {
 /* timing/sysex + 16 channels */
 #define TRACKS_PER_PORT 17
 
-/* metronome settings */
-/* TODO: create options for this */
-#define METRONOME_CHANNEL 9
-#define METRONOME_STRONG_NOTE 34
-#define METRONOME_WEAK_NOTE 33
-#define METRONOME_VELOCITY 100
-#define METRONOME_PROGRAM 0
-
 static snd_seq_t *seq;
 static int client;
 static int port_count;
-static snd_seq_addr_t *ports;
+static snd_seq_addr_t port;
 static int queue;
 static int smpte_timing = 0;
 static int beats = 120;
@@ -75,13 +67,6 @@ static int channel_split;
 static int num_tracks;
 static struct smf_track *tracks;
 static volatile sig_atomic_t stop = 0;
-static int use_metronome = 0;
-static snd_seq_addr_t metronome_port;
-static int metronome_weak_note = METRONOME_WEAK_NOTE;
-static int metronome_strong_note = METRONOME_STRONG_NOTE;
-static int metronome_velocity = METRONOME_VELOCITY;
-static int metronome_program = METRONOME_PROGRAM;
-static int metronome_channel = METRONOME_CHANNEL;
 static int ts_num = 4; /* time signature: numerator */
 static int ts_div = 4; /* time signature: denominator */
 static int ts_dd = 2; /* time signature: denominator as a power of two */
@@ -132,43 +117,22 @@ static void init_seq(void)
 }
 
 /* parses one or more port addresses from the string */
-static void parse_ports(const char *arg)
+static void parse_port(const char *arg)
 {
-	char *buf, *s, *port_name;
+	const char *port_name;
 	int err;
 
-	/* make a copy of the string because we're going to modify it */
-	buf = strdup(arg);
-	check_mem(buf);
-
-	for (port_name = s = buf; s; port_name = s + 1) {
-		/* Assume that ports are separated by commas.  We don't use
-		 * spaces because those are valid in client names. */
-		s = strchr(port_name, ',');
-		if (s)
-			*s = '\0';
-
-		++port_count;
-		ports = realloc(ports, port_count * sizeof(snd_seq_addr_t));
-		check_mem(ports);
-
-		err = snd_seq_parse_address(seq, &ports[port_count - 1], port_name);
-		if (err < 0)
-			fatal("Invalid port %s - %s", port_name, snd_strerror(err));
+	port_name = arg;
+	
+	if (strchr(port_name, ',') != NULL) {
+		fatal("Only 1 port allowed (this differs from standard ALSA arecordmidi)");
 	}
-
-	free(buf);
-}
-
-/* parses the metronome port address */
-static void init_metronome(const char *arg)
-{
-	int err;
-
-	err = snd_seq_parse_address(seq, &metronome_port, arg);
+	
+	err = snd_seq_parse_address(seq, &port, port_name);
 	if (err < 0)
-		fatal("Invalid port %s - %s", arg, snd_strerror(err));
-	use_metronome = 1;
+		fatal("Invalid port %s - %s", port_name, snd_strerror(err));
+	
+	port_count += 1;
 }
 
 /* parses time signature specification */
@@ -187,56 +151,6 @@ static void time_signature(const char *arg)
 	ts_div = x;
 	for (ts_dd = 0; x > 1; x /= 2)
 		++ts_dd;
-}
-
-/*
- * Metronome implementation
- */
-static void metronome_note(unsigned char note, unsigned int tick)
-{
-	snd_seq_event_t ev;
-	snd_seq_ev_clear(&ev);
-	snd_seq_ev_set_note(&ev, metronome_channel, note, metronome_velocity, 1);
-	snd_seq_ev_schedule_tick(&ev, queue, 0, tick);
-	snd_seq_ev_set_source(&ev, port_count);
-	snd_seq_ev_set_subs(&ev);
-	snd_seq_event_output(seq, &ev);
-}
-
-static void metronome_echo(unsigned int tick)
-{
-	snd_seq_event_t ev;
-	snd_seq_ev_clear(&ev);
-	ev.type = SND_SEQ_EVENT_USR0;
-	snd_seq_ev_schedule_tick(&ev, queue, 0, tick);
-	snd_seq_ev_set_source(&ev, port_count);
-	snd_seq_ev_set_dest(&ev, client, port_count);
-	snd_seq_event_output(seq, &ev);
-}
-
-static void metronome_pattern(unsigned int tick)
-{
-	int j, t, duration;
-
-	t = tick;
-	duration = ticks * 4 / ts_div;
-	for (j = 0; j < ts_num; j++) {
-		metronome_note(j ? metronome_weak_note : metronome_strong_note, t);
-		t += duration;
-	}
-	metronome_echo(t);
-	snd_seq_drain_output(seq);
-}
-
-static void metronome_set_program(void)
-{
-	snd_seq_event_t ev;
-
-	snd_seq_ev_clear(&ev);
-	snd_seq_ev_set_pgmchange(&ev, metronome_channel, metronome_program);
-	snd_seq_ev_set_source(&ev, port_count);
-	snd_seq_ev_set_subs(&ev);
-	snd_seq_event_output(seq, &ev);
 }
 
 static void init_tracks(void)
@@ -302,7 +216,7 @@ static void create_queue(void)
 		      snd_seq_queue_tempo_get_ppq(tempo));
 }
 
-static void create_ports(void)
+static void create_port(void)
 {
 	snd_seq_port_info_t *pinfo;
 	int i, err;
@@ -310,7 +224,7 @@ static void create_ports(void)
 
 	snd_seq_port_info_alloca(&pinfo);
 
-	/* common information for all our ports */
+	/* common information for all our one port */
 	snd_seq_port_info_set_capability(pinfo,
 					 SND_SEQ_PORT_CAP_WRITE |
 					 SND_SEQ_PORT_CAP_SUBS_WRITE);
@@ -334,40 +248,16 @@ static void create_ports(void)
 		err = snd_seq_create_port(seq, pinfo);
 		check_snd("create port", err);
 	}
-
-	/* create an optional metronome port */
-	if (use_metronome) {
-		snd_seq_port_info_set_port(pinfo, port_count);
-		snd_seq_port_info_set_name(pinfo, "arecordmidi metronome");
-		snd_seq_port_info_set_capability(pinfo,
-						 SND_SEQ_PORT_CAP_READ |
-						 SND_SEQ_PORT_CAP_WRITE);
-		snd_seq_port_info_set_type(pinfo, SND_SEQ_PORT_TYPE_APPLICATION);
-		snd_seq_port_info_set_midi_channels(pinfo, 0);
-		snd_seq_port_info_set_timestamping(pinfo, 0);
-		err = snd_seq_create_port(seq, pinfo);
-		check_snd("create metronome port", err);
-	}
 }
 
-static void connect_ports(void)
+static void connect_port(void)
 {
-	int i, err;
+	int err;
 
-	for (i = 0; i < port_count; ++i) {
-		err = snd_seq_connect_from(seq, i, ports[i].client, ports[i].port);
-		if (err < 0)
-			fatal("Cannot connect from port %d:%d - %s",
-			      ports[i].client, ports[i].port, snd_strerror(err));
-	}
-
-	/* subscribe the metronome port */
-	if (use_metronome) {
-	        err = snd_seq_connect_to(seq, port_count, metronome_port.client, metronome_port.port);
-		if (err < 0)
-	    		fatal("Cannot connect to port %d:%d - %s",
-			      metronome_port.client, metronome_port.port, snd_strerror(err));
-	}
+	err = snd_seq_connect_from(seq, 0, port.client, port.port);
+	if (err < 0)
+		fatal("Cannot connect from port %d:%d - %s",
+				port.client, port.port, snd_strerror(err));
 }
 
 /* records a byte to be written to the .mid file */
@@ -450,11 +340,6 @@ static void record_event(const snd_seq_event_t *ev)
 
 	/* determine which track to record to */
 	i = ev->dest.port;
-	if (i == port_count) {
-		if (ev->type == SND_SEQ_EVENT_USR0)
-			metronome_pattern(ev->time.tick);
-		return;
-	}
 	if (channel_split) {
 		i *= TRACKS_PER_PORT;
 		if (snd_seq_ev_is_channel_type(ev))
@@ -694,7 +579,6 @@ static void help(const char *argv0)
 		"  -f,--fps=frames            resolution in frames per second (SMPTE)\n"
 		"  -t,--ticks=ticks           resolution in ticks per beat or frame\n"
 		"  -s,--split-channels        create a track for each channel\n"
-		"  -m,--metronome=client:port play a metronome signal\n"
 		"  -i,--timesig=nn:dd         time signature\n"
 		"  -T,--timeout=n             stop recording n milliseconds after the last event\n",
 		argv0);
@@ -723,7 +607,6 @@ int main(int argc, char *argv[])
 		{"ticks", 1, NULL, 't'},
 		{"split-channels", 0, NULL, 's'},
 		{"dump", 0, NULL, 'd'},
-		{"metronome", 1, NULL, 'm'},
 		{"timesig", 1, NULL, 'i'},
 		{"timeout", 1, NULL, 'T'},
 		{ }
@@ -751,7 +634,7 @@ int main(int argc, char *argv[])
 			do_list = 1;
 			break;
 		case 'p':
-			parse_ports(optarg);
+			parse_port(optarg);
 			break;
 		case 'b':
 			beats = atoi(optarg);
@@ -776,9 +659,6 @@ int main(int argc, char *argv[])
 			break;
 		case 'd':
 			fputs("The --dump option isn't supported anymore, use aseqdump instead.\n", stderr);
-			break;
-		case 'm':
-			init_metronome(optarg);
 			break;
 		case 'i':
 			time_signature(optarg);
@@ -817,8 +697,8 @@ int main(int argc, char *argv[])
 
 	init_tracks();
 	create_queue();
-	create_ports();
-	connect_ports();
+	create_port();
+	connect_port();
 	if (port_count > 1)
 		record_port_numbers();
 
@@ -858,11 +738,6 @@ int main(int argc, char *argv[])
 	err = snd_seq_nonblock(seq, 1);
 	check_snd("set nonblock mode", err);
 	
-	if (use_metronome) {
-		metronome_set_program();
-		metronome_pattern(0);
-	}
-
 	signal(SIGINT, sighandler);
 	signal(SIGTERM, sighandler);
 
